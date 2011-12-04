@@ -1,0 +1,834 @@
+#!/bin/bash
+
+#######################################################################################
+# DVDAssimilator3000 CLI edition
+#
+# Copyright 2008-2011 Marios Andreopoulos (aka mrsaccess), DA3000 at andmarios dot com
+# Distributed under the terms of the GNU General Public License v2
+#
+# DVDAssimilator3000 is a bash script to rip (optional), encode and store DVDs to matroska.
+# Key Features:
+#  - Source can be a DVD disk, a ISO/IMG DVD image, a ripped DVD folder
+#  - Video is encoded in H.264
+#  - You can select multiple audio tracks, we don't re-encode them, you keep the original audio
+#  - You can select as many subtitle tracks from the DVD as you like
+#  - Chapter information get extracted from the DVD
+#  - Usually you get really good quality for about a 3rd of the DVD main title's size
+#  - Simplicity was the prerequisite, you don't have to do any difficult decisions.
+#  - Final file is a mkv, with multiple audio and subtitle tracks (language codes
+#    included), chapter and title information
+#
+#
+# DVDAssimilator3000 CLI Edition is distributed in the hope that it will
+# be useful, but WITHOUT ANY WARRANTY. YOU USE AT YOUR OWN RISK. THE
+# AUTHOR WILL NOT BE LIABLE FOR DATA LOSS, DAMAGES, LOSS OF PROFITS OR
+# ANY OTHER KIND OF LOSS WHILE USING OR MISUSING THIS SOFTWARE.
+# See the GNU General Public License for more details.
+#
+#
+# Version: 1.5.2 beta
+#
+# Version notice:
+#  beta version, use with caution
+#  Data loss or system damage is highly unlikely to occur
+#  due to this script. However runaway processes OR HDD getting
+#  full of unneeded data is possible.
+#
+# Changelog:
+#   1.5.2
+#       - Changed code (UI and backend) to use quality (crf) based encoding
+#       - Updated help options and readme at the top of the file
+#       - Now in the xml file the mencoder command line is also saved
+#   1.5.1 
+#       ! version only for internal testing, not usable
+#       - Preliminary change from bitrate based encoding to quality based
+#   1.5.0
+#       - Simplify mencoder settings, to almost default settings. I hope this will help
+#         to keep videos playable by most devices without loss of quality (maybe even gain?)
+#         and of course the script will be less breakable due to mencoder's options changing
+#         over time.
+#       - Started using mencoder's tune setting
+#   1.4.0
+#       - Small changes since mplayers command line has changed in the years and didn't
+#         work. Specifically changed b_pyramid to b_pyramid=1
+#       - Addition of the tune option of x264opts in mencoder, adjust for film or animation
+#       - prevented mencoder from hardcoding random subtitles sometimes
+#   1.3.1 beta
+#       Not sure because some years passed since I checked it. I see some preliminary
+#       work for job queue but will not complete it for now.
+#   1.2 beta
+#       - A created by DA3000 tag is inserted in the mkv now.
+#       - Dropped use of bc as some distros do not install it, using printf instead.
+#       - Added dependency checking.
+#       - Removing temp files is now more cautious.
+#       - Added debug switches support to the script (ie --keep-temp).
+#       - Introduced anime mode and disable 1st pass debug switch.
+#       - Default bitrate reduced from 1900kbps to 1800kbps
+#       - Cropdetect set to round crop settings to multiples of 16. CRITICAL!
+#       - Changes to the encoding settings of the default 2nd pass resulting in a small
+#         quality gain and a speed decrease.
+#   1.0 beta
+#       initial release
+#
+# Dependencies:
+#   mplayer with x264 support
+#   mkvtoolnix
+#   cdrtools or libcdio (for working with subtitles of DVD images [iso/img])
+#   ogmtools (optional, for chapter extraction)
+#   transcode
+#   subtitleripper
+#######################################################################################
+
+
+#======================================================================================
+# debugCenter! :p
+#======================================================================================
+disableStages=""    # Disable slow stages in order to speed debug. Available modules:
+                    #   cp: copy movie to workDirectory
+                    #   sub   : process subtitles
+                    #   aud   : process audio
+                    #   enc   : encode video
+                    #   1pass : 1st pass of video encoding
+keepTempFiles="no"  # Set if you want to keep the temp files. Usefull in case the
+                    # mkvmerge stages fails and you know your way around "DVD to mkv"
+                    # to work it out.
+secondPass="normal" # Options are : fast / normal / slow                                needs description!
+                    # Set if you want a slow or fast 2nd pass. Fast pass has good
+                    # quality, although not as good as the slow one. IT IS USABLE!
+                    # Slow mode has an additional advantage: According to some doom9
+                    # posts it should be fully compatible with hardware decoding, even
+                    # from PowerDVD. Unfortunately I do not have hardware to verify it.
+
+#======================================================================================
+# TamperPanel: variables you may want to change
+#======================================================================================
+THREADS="auto"  # How many threads mencoder will use. Set to 1 or auto. Auto is really
+                # faster if you have more than one core, 1 has slightly better quality.
+                # Of course this setting has no effect in one core, no HT systems.
+FRAMEREF="5"    # An option of x264 encoder. 5 is a good choice, we set it to 3 for
+                # fast mode and to 8 for anime mode.
+
+#======================================================================================
+# mrsaccess coding style variables :p
+#======================================================================================
+systemEncoding="utf8"
+progName="DVDAssimilator3000 CLI Edition"
+progVersion="1.5.2 beta"
+releaseName="stayed too long into the matrix"
+fullProg="${progName}-${progVersion}"
+
+#======================================================================================
+# color codes
+#======================================================================================
+rst="\033[0m";      blink="\033[5m";    cls="\033[2J"
+red="\033[31m";     redB="\033[1;31m"
+green="\033[32m";   greenB="\033[1;32m"
+yellow="\033[33m";  yellowB="\033[1;33m"
+blue="\033[34m";    blueB="\033[1;34m"
+magenta="\033[35m"; magentaB="\033[1;35m"
+cyan="\033[36m";    cyanB="\033[1;36m"
+white="\033[37m";   whiteB="\033[1;37m"
+black="\033[30m";   blackB="\033[1;30m"
+
+#======================================================================================
+# various uncategorizable variables
+#======================================================================================
+readPrompt="|¤| "
+
+#======================================================================================
+# exit codes
+#======================================================================================
+ERR_FILESYSTEM="65"
+ERR_DEPENDENCY="127"
+
+#======================================================================================
+# initializing (do not change these as they will propably get changed at execution)
+#======================================================================================
+sourcePath=""                   # DVD folder, mount, iso location
+tempPath=""                     # in here we will create our work directory
+workDirectory=""                # full path of work directory
+dvdInfo="dvdinfo"               # Text file with the mplayer output for the main title.
+mainTitle=""                    # DVD main title
+mainTitleLength=""              # DVD main title length
+subtitlesToKeep=""              # Subtitles to keep by id, seperated by spaces.
+movieFps="25"                   # Set movie framerate to PAL. We autodetect it later.
+mainIfoCopied="0"               # Have we managed to copy the main title ifo?
+                                # Needed for image (iso) sources.
+ifoIsoPath=""                   # Path of main title ifo in a DVD iso image
+audioStreamsToKeep=""           # Audio streams to keep by aid, seperated by spaces.
+CROP=""                         # Crop settings
+BITRATE="1800"                  # Bitrate to use for video encoding. Obsolette
+CRF="19"                        # crf to use for video encoding
+movieTitle=""                   # Movie title
+movieFile="movie.mkv"           # File to save movie.
+mkvmergeSettings="mmsettings"   # File to save mkvmerge settings (called options file).
+encoderCommandLine=""           # Here we'll store the command passed to the encoder, to store in the xml
+counter="0"                     # A simple counter variable.
+language=""                     # Just a variable named to ease reading of the code
+jobAdd="0"                      # Boolean which shows if we adding a job.
+jobRun="0"                      # Boolean which shows if we processing a job.
+jobFile=""                      # File with job settings.
+mplayerAddVfParams=""           # Parameters to add to the mplayer -vf switch.
+MP_TUNE="film"                  # Default parameter for the mplayer tune value
+MP_PRESET="slow"                # Default mencoder preset is slow, can be changed from the command line
+
+#======================================================================================
+# version, help, voids (akira in greek army dialect :p)
+#   INFO     : DVDAssimilator3000 CLI does not take any parameters. Some standard
+#       parameters though should always be implemented: help and version respectively.
+#       Also we should detect parameters anyway and not run the script as the user may
+#       didn't want to run it since he/she apparently don't know how it works.
+#   LAST EDIT: 2011-10-14 11:55
+#======================================================================================
+version_info(){
+ cat <<EOF
+ 
+ ${progName}, version ${progVersion} "${releaseName}"
+ Copyright (C) 2008-11 Marios Andreopoulos (aka mrsaccess)
+ 
+ This script was inspired from this article on gentoo-wiki.com:
+ http://gentoo-wiki.com/HOWTO_DVD_to_Matroska
+
+EOF
+}
+
+help_info(){
+ cat <<EOF
+ 
+ DVDAssimilator3000 CLI edition does not need any parameters in order to run.
+ When executed it will ask you six simple questions (such as where your DVD rests) and
+ then it will proceed to the rip/encoding process.
+ 
+ There are though some parameters available, mostly for debugging reasons or to help
+ people who know their way around to repeat a session without having to go through all
+ the encode stages again. Here there are:
+    --fast          Make the second pass of video encoding faster lowering quality.
+    --slow          Make the second pass of video encoding slower enchancing quality.
+                    Not recommended as it is too slow. Also the file may not be play-
+                    able by some stand-alone players due to the use of advanced tech-
+                    niques (H.264 LEVEL 5.1 encoding).
+    --keep-temp     DA3000 will not delete the temp files. Useful if you want to repeat
+                    the session without repeating all stages again.
+    --no-copy       DA3000 won't copy the movie from the DVD. Useful after a
+                    --keep-temp session.
+    --no-subs       DA3000 won't process the subtitles, though it WILL ask you which
+                    subtitles to keep. Useful after a --keep-temp session.
+    --no-audio      DA3000 won't process the audio, though it WILL ask you which audio
+                    streams to keep. Useful after a --keep-temp session.
+    --no-encoding   DA3000 won't bother with video encoding at all. Useful after a
+                    --keep-temp session.
+    --anime         This may give higher quality if you are encoding an anime. Using it
+                    with normal movies isn't recommended.
+    --pullup        Use pullup filter (usefull for IVTC).
+    --deinterlace   Use a deinterlace filter.
+ 
+ You said you don't know what this program do?
+  DVDAssimilator3000 is a bash script to rip (optional), encode and store DVDs to matroska.
+  It can use a mounted DVD, a ripped DVD folder on your hard drive or a ripped DVD
+  image (iso or img) as source and it will always encode the main title of the DVD. It
+  goes for simplicity so it doesn't give you much options and especially no options for
+  the encoding quality except bitrate. For the video encoding it uses x264 with high
+  quality settings. For audio it uses the original audio streams (it asks you to select
+  which audio streams you want to keep). Same goes for the subtitles which it rips to
+  vobsub format. Everything (including chapters) is enclosed in the final mkv file,
+  language codes are also saved where applicable (audio / subtitles streams).
+
+EOF
+#Should add this if I fix job control
+#    --add-job       Will let you create a job file for later processing.
+#    --job <file>    Load the job saved to <file> and process it.
+}
+
+for ((i=$OPTIND; i<=$#; ++i)); do
+  case ${!i} in
+      -v | --version ) version_info; exit;;
+      -h | --help    ) help_info; exit;;
+      --no-copy      ) disableStages="$disableStages cp";;
+      --no-subs      ) disableStages="$disableStages sub";;
+      --no-audio     ) disableStages="$disableStages aud";;
+      --no-encoding  ) disableStages="$disableStages enc";;
+      --fast         ) secondPass="fast";;
+      --keep-temp    ) keepTempFiles="yes";;
+      --anime        ) FRAMEREF="8"; MP_TUNE="animation";;
+      --add-job      ) jobAdd="1";;
+      --job          ) jobRun="1"; let i++; jobFile="${i}";;
+      --pullup       ) mplayerAddVfParams="${mplayerAddVfParams}pullup,softskip,";;
+      --deinterlace  ) mplayerAddVfParams="${mplayerAddVfParams}yadif=3:1,mcdeint=2:1:\
+10,";;
+      * ) version_info; help_info; exit 1;;
+  esac
+done
+
+
+#**************************************************************************************
+# The main program starts here. The script from here on has "sequential" programming.
+# I do not set the functions first but I set them when I need it, kinda inline let's
+# say. So the script executes in the order you read it.
+#**************************************************************************************
+
+
+#======================================================================================
+# Looking cool is a neccesity.
+#   INFO     : Welcome Screen.
+#   LAST EDIT:
+#======================================================================================
+ShowLogo(){
+echo -e "${green}\
+   ___ _   _____  ___           _       _ __     __            ____ ___  ___  ___ \n\
+  / _ \ | / / _ \/ _ | ___ ___ (_)_ _  (_) /__ _/ /____  ____ |_  // _ \/ _ \/ _ \ \n\
+ / // / |/ / // / __ |(_-<(_-</ /  ' \/ / / _ ΄/ __/ _ \/ __/_/_ </ // / // / // / \n\
+/____/|___/____/_/ |_/___/___/_/_/_/_/_/_/\_,_/\__/\___/_/  /____/\___/\___/\___/ \n\
+${rst}"
+}
+[[ -f /usr/bin/clear ]] && clear
+ShowLogo
+echo -e "${yellow}Version : ${redB}${progVersion}${rst}"
+echo -e "${yellow}Codename: ${cyanB}${releaseName}${rst}"
+echo
+echo "Welcome!"
+unset PROMPT_COMMAND
+echo -ne "\033]0;DA3000, questioning\007"
+
+#======================================================================================
+# Dependency checking and concurrent use of add / run job.
+#   INFO     :
+#   LAST EDIT: 2008-05-19 15:42
+#======================================================================================
+echo
+if ! mencoder -ovc help | grep -sq x264; then
+    echo -e "Your mencoder doesn't support x264 encoder. Install a mplayer version \
+with x264 support\nif you want to use DVDAssimilator3000.\n"
+    exit $ERR_DEPENDENCY
+fi
+if ! which mkvmerge >/dev/null 2>&1; then
+    echo -e "mkvtoolnix seems not to be installed on your machine. Please install it \
+if you want to\nuse DVDAssimilator3000.\n"
+    exit $ERR_DEPENDENCY
+fi
+if ! which isoinfo >/dev/null 2>&1 && ! which iso-info >/dev/null 2>&1; then
+    echo -e "Neither of cdrtools or libcdio seems to be installed on your system. If \
+you want to use\nDVDAssimilator3000 on DVD iso/img images and want to extract \
+subtitles from them you\nshould install one of these programs."
+fi
+if ! which dvdxchap >/dev/null 2>&1; then
+    echo -e "It seems ogmtools are not installed. DVD chapters will not be extracted."
+fi
+if ! which tccat >/dev/null 2>&1; then
+    echo -e "You don't have transcode installed. Subtitle processing will be \
+disabled."
+    disableStages="$disableStages sub"
+fi
+if ! which subtitle2vobsub >/dev/null 2>&1; then
+    echo -e "You don't have subtitleripper installed. Subtitle processing will be \
+disabled."
+    disableStages="$disableStages sub"
+fi
+if [[ $jobAdd == 1 ]] && [[ $jobRun == 1 ]]; then
+    echo -e "Concurrent use of --job and --add-job switch. Please use just one of \
+these.\n"
+    exit 1
+fi
+
+#======================================================================================
+# Ask where the DVD rests!
+#   INFO     : Question 1 of 6
+#   LAST EDIT: 2008-05-11 14:54
+#======================================================================================
+echo
+cat <<EOF
+Where does your DVD rest? Give me a path to a mounted DVD, a ripped DVD folder or an
+ISO image. I'm easy! Though please no DVDs with ARcoSS protection.
+EOF
+SourceAsk() {
+    read -e -p "${readPrompt}" sourcePath
+    if [ ! -r  "${sourcePath}" ]; then
+        echo -e "The file or path you gave doesn't exist. Here, try again."
+        SourceAsk
+    fi
+    if ! mplayer -dvd-device "${sourcePath}" -ao null -vo null -frames 0 -identify \
+dvd://0  2>/dev/null | grep -sq -m1 "ID_"; then
+        echo -e "What you gave me isn't a DVD according to mplayer. Here, try again!"
+        SourceAsk
+    fi
+}
+SourceAsk
+# Next line converts a relative path to an absolute one.
+[[ "${sourcePath}" = /* ]] || sourcePath="$PWD/${sourcePath}"
+[[ -r "${sourcePath}" ]] || exit $ERR_FILESYSTEM
+
+
+#======================================================================================
+# Analyze DVD to find main title index, duration, framerate.
+#   INFO     :
+#   LAST EDIT: 2008-05-11 16:36
+#======================================================================================
+echo
+echo "Analyzing DVD structure."
+mainTitleLength="$(mplayer -dvd-device "${sourcePath}" -ao null -vo null -frames 0 \
+ -identify dvd://0  2>/dev/null | grep -E "TITLE.*LENGTH" | sed -e 's/.*=//' | \
+ sort -g | tail -n1)"
+mainTitle="$(mplayer -dvd-device "${sourcePath}" -ao null -vo null -frames 0 \
+ -identify dvd://0  2>/dev/null | grep -E "TITLE.*LENGTH.*${mainTitleLength}" | \
+ sed -e 's/.*TITLE_\(.*\)_LENGTH.*/\1/')"
+movieFps="$(mplayer -dvd-device "${sourcePath}" -ao null -vo null -frames 0 -identify \
+ dvd://0  2>/dev/null | grep -E "ID_VIDEO_FPS" | sed -e 's/ID_VIDEO_FPS=//')"
+echo -e "DVD analyzed. Main title is title #$mainTitle and has a duration of \
+$mainTitleLength secs and\na framerate of $movieFps fps."
+
+
+#======================================================================================
+# Ask for temp folder. Should be LARGE.
+#   INFO     : Question 2 of 6
+#   LAST EDIT: 2008-05-21 14:23
+#======================================================================================
+echo
+echo -e "Now I need you to give me a directory large enough for my temp files. I would\
+ suggest\n10GB free space."
+TempAsk() {
+    read -e -p "${readPrompt}" tempPath
+    if [ ! -d "${tempPath}" -o ! -w  "${tempPath}" ]; then 
+        echo -e "The path you gave me doesn't exist or it isn't writeable. \
+Try again."
+        TempAsk
+    fi
+    tempPath="$(echo "${tempPath}"|sed -e 's/\/$//')";
+}
+TempAsk
+
+
+#======================================================================================
+# Determine workDirectory and create the dvdInfo file.
+#   INFO     :
+#   LAST EDIT: 2008-05-12 01:29
+#======================================================================================
+workDirectory="${tempPath}/DA3000-$(echo "${sourcePath}" |sed -e \
+ 's/\(.*\)\/VIDEO_TS/\1/' -e 's/\/$//' -e 's/\.[iI][sS][oO]$//' \
+ -e 's/.*\///' -e 's/ /_/g' -e 's/(/[/g' -e 's/)/]/g')"
+echo
+echo -e "Good. I think I'll create a directory to work in. It shall be... \
+\n${greenB}${workDirectory}${rst} !"
+if ! mkdir -p "${workDirectory}"; then
+    echo "Oops, I wasn't able to create the work directory. Exiting in shame."
+    exit $ERR_FILESYSTEM
+fi
+[[ "${workDirectory}" = /* ]] || workDirectory="$PWD/${workDirectory}"
+cd "${workDirectory}" || exit $ERR_FILESYSTEM
+dvdInfo="${workDirectory}/${dvdInfo}"
+mplayer -dvd-device "${sourcePath}" dvd://"${mainTitle}" -ao null -vo null -frames 0 \
+ > "${dvdInfo}" 2>/dev/null
+
+
+#======================================================================================
+# Ask user to select which subtitles to keep.
+#   INFO     : Question 3 of 6
+#   LAST EDIT: 2008-05-12 01:31
+#======================================================================================
+echo
+if ! cat "${dvdInfo}" | grep "subtitles on disk: 0" >/dev/null 2>&1; then
+    echo -e "Ok, now we need to work with the subtitles so I need your full attention.\
+\nPress any key and I'll show you a list of the available subtitles. ;)"
+    read -n1 temp
+    echo
+    echo "*** subtitles ***"
+    cat "${dvdInfo}" | grep --color=never subtitle
+    echo
+    echo -e "What I need from you is to give me which subtitles you want me to keep. \
+Just write the\n(s)ids seperated by a space. An example would be ${magentaB}0 3 2 5 11\
+${rst}. This means I would keep\nsubtitles 0, 2, 3, 5, 11 and place them in the final \
+mkv with the order you gave them\nto me."
+    read -p "${readPrompt}" subtitlesToKeep
+else
+    echo "No subtitles detected."
+fi
+
+
+#======================================================================================
+# Ask user which audio streams to keep.
+#   INFO     : Question 4 of 6
+#   LAST EDIT: 2008-05-12 16:24
+#======================================================================================
+echo
+echo "Now we will see which audio streams we should keep."
+echo "Press any key and I'll show you a list of the available audio streams."
+read -n1 temp
+echo
+echo "*** audio streams ***"
+cat "${dvdInfo}" | grep --color=never "audio stream" | sed -e 's/.* format:/format:/'
+echo
+echo -e "Usually you should keep only one audio stream unless you have a good reason. \
+If there\nis an AC3 5.1 track I suggest keeping this one. Often it has aid 128. Now \
+give me the\naudio channels you want me to keep like you did with the subtitles. \
+ie ${magentaB}128 132 131${rst}"
+read -p "${readPrompt}" audioStreamsToKeep
+
+
+#======================================================================================
+# Ask for CRF
+#   INFO     : Question 5 of 6
+#   LAST EDIT: 2011-10-13 12:00
+#======================================================================================
+echo
+echo -e "\
+Quality matters. DVDAssimilator3000 goes for archival quality, thus we believe\n\
+that video quality should remain relatively constant instead of keeping video\n\
+bitrate constant (and size more predictable). So we adjust the crf instead of\n\
+of the bitrate. Crf is a value that represents perceivable quality. We suggest\n\
+a crf value of ${CRF} which gives very good quality for a moderate file size,\n\
+usually between 1.5 and 2 GiB for a movie. You can adjust it though if you like.\n\
+You can try a value of 18 for top quality, or a value between 20 and 21 for smaller\n\
+size. Please note that size and quality depends a little on encoding speed too."
+read -p "${readPrompt}" temp
+if [[ ${temp} != *[^0-9]* ]] && [[ ${temp} != "" ]]; then   # Is temp an integer?
+    if (( ${temp} > 14 )) && (( ${temp} < 30 )); then
+        CRF="${temp}"
+        echo "Nice, crf ${CRF} will be used." 
+    else
+        echo "Crf should remain between 15 and 29. Default crf of ${CRF} will be used."
+    fi
+else
+    echo "Default crf of ${CRF} will be used."
+fi
+
+
+#======================================================================================
+# Ask movie title
+#   INFO     : Question 6 of 6
+#   LAST EDIT: 2011-10-13 16:32
+#======================================================================================
+echo
+echo -e "Ah, the final bit of information before I get to work!\n\
+What's the title of the movie? You can use fancy characters here."
+read -p "${readPrompt}" -r movieTitle
+echo
+echo
+echo "That's it! I will be busy for some time now, but you can take your leave."
+
+
+#======================================================================================
+# Let's rip the DVD main title in our work directory.
+#   INFO     : Question 6 of 6
+#   LAST EDIT: 2008-05-12 17:08
+#======================================================================================
+if ! echo "$disableStages" | grep -sq -i "cp"; then     # debuf if
+echo -ne "\033]0;DA3000, copying movie [${movieTitle}]\007"
+echo
+echo -e "Copying movie in our work directory. This will take a while, don't get \
+alarmed from the\nabsence of a progress indicator."
+mplayer -dvd-device "${sourcePath}" dvd://${mainTitle} -dumpstream -dumpfile \
+ "${workDirectory}/movie.vob" > /dev/null 2>&1
+fi                                                      # close debug if
+
+
+#======================================================================================
+# Crop detect.
+#   INFO     :
+#   LAST EDIT: 2008-05-19 12:40
+#======================================================================================
+echo -ne "\033]0;DA3000, detecting crop settings [${movieTitle}]\007"
+echo
+echo "Automatically detecting crop settings. Pray to your gods for me."
+# The next command (which uses mplayer to detect crop settings) can fail although this
+# is extremely rare. Why this? mplayer detects crop settings from each frame it plays
+# and keeps the biggest area it has seen movie in. That is a frame cannot say to crop
+# more than the previous frames. The problem is that if we ask mplayer to inspect all
+# movie frames it would need too much time and unfortunately the -sstep switch doesn't
+# work with te ripped vob. So we examine a sample of 1200 frames (48 seconds for PAL)
+# located after the first 2000.000.000 bytes of movie. If for some reason the movie
+# at this time doesn't fill all of it's frame space then we'll detect wrong settings.
+CROP="$(mplayer "${workDirectory}/movie.vob" -ao null -vo null -frames 1200 -fps 200 \
+ -sb  200000000 -vf cropdetect=round 2>/dev/null | tail -n5 | grep -i -m1 "crop" | \
+ sed -e 's/.*=//' -e 's/).*//')"
+echo "Crop settings detected: ${CROP}"
+
+
+#======================================================================================
+# If dvdxchap exists read chapters.
+#   INFO     :
+#   LAST EDIT: 2008-05-12 18:12
+#======================================================================================
+echo
+echo "Extracting chapter info for later use in mkv creation."
+if which dvdxchap >/dev/null 2>&1; then
+    dvdxchap -t ${mainTitle} "${sourcePath}" > "${workDirectory}/chapters.txt" \
+ 2>/dev/null
+else
+    echo -e "I couldn't find ${redB}dvdxchap${rst} so I the final video won't have \
+chapters. You might\nconsider installing ogmtools."
+fi
+
+
+#======================================================================================
+# Subtitles processing! This is a *complex* process (relative to other sections).
+#   INFO     :  I'll do some explaining here as subtitles turn to be a little complex
+#       to automate. To my knowledge there are two methods to extract subtitle streams
+#       to vobsub format: using mencoder vobsubout filter or using tccat and
+#       subtitle2vobsub from transcode and subtitleripper packages. The second method
+#       is harder as you need the main title IFO file. Unfortunately the main title
+#       number isn't always the correct IFO number (ie Title 1 may be at VTS_04_0.IFO).
+#       Even worse if we encode from a DVD image we have to extract the IFO file.
+#       mencoder method is much, mush easier but has two serious flaws: it does not
+#       work correctly so it isn't usable and because for every subtitle stream it
+#       reads the source, in case you are ripping a DVD disk it will have to read the
+#       the disk one time for every sub stream you choosed. That stresses you DVD ROM.
+#           So I had to choose the tccat / subtitle2vobsub method and find a way to
+#       detect the correct IFO file. The most robust and easy way I found is to use the
+#       biggest IFO file in the DVD. This method haven't failed me yet but you it'll
+#       always be possible to fail for some disk.
+#   LAST EDIT: 2011-09-12 15:42
+#======================================================================================
+if ! echo "$disableStages" | grep -sq -i "sub"; then    # debuf if
+echo -ne "\033]0;DA3000, processing subtitles [${movieTitle}]\007"
+echo
+# Copy main title ifo. We need this to get later subtitle info (color, language)
+if [ -d "${sourcePath}" ];  then
+    # If the movie is in a directory or a mounted medium just copy it.
+    cp "$(find "${sourcePath}" -iregex .*VTS.*IFO -printf "%s %p\n" | sort -nr | \
+ head -n1 | sed -e 's/^[[:digit:]]* //')" "${workDirectory}/IFO"
+    mainIfoCopied="1"
+else
+    # If the movie is an image (iso) extract the main title IFO.
+        # Try isoinfo utility, included in cdrtools
+    if which isoinfo >/dev/null 2>&1; then
+        ifoIsoPath="/VIDEO_TS/$( isoinfo  -l -i "${sourcePath}" 2>/dev/null | grep -i \
+ "ifo" | sed -e "s/^[-]*[[:space:]]*[[:digit:]]*[[:space:]]*[[:digit:]]*[[:space:]]* \
+[[:digit:]]*[[:space:]]*\([[:digit:]]*\) .*]/\1/" | sort -nr | head -n1 | sed -e \
+ 's/^[[:space:]]*[[:digit:]]* //' )"
+        isoinfo -i "${sourcePath}" -x ${ifoIsoPath} >"${workDirectory}/IFO" 2>/dev/null
+        if [ $? == 0 ]; then    # Checking just in case something went wrong.
+            mainIfoCopied="1"
+            echo "Used cdrtools isoinfo to extract main title ifo."
+        fi
+    fi
+        # If isoinfo didn't manage the job (cause it wasn't installed or...) try
+        # iso-info, iso-read from libcdio
+    if [ ${mainIfoCopied} == 0 ]; then
+        ifoIsoPath="$(iso-info -i "${sourcePath}" -f 2>/dev/null | grep -i "ifo" | \
+ sort -nr | head -n1 | sed -e 's/^[[:space:]]*[[:digit:]]* //')"
+        iso-read -i "${sourcePath}" -e "${ifoIsoPath}" -o "${workDirectory}/IFO"
+        if [ $? == 0 ]; then
+            mainIfoCopied="1"
+            echo "Used libcdio iso-info and iso-read to extract main title ifo."
+        else
+            echo "Wasn't able to extract main title ifo file. There may be a problem \
+with the subtitles."
+        fi
+    fi
+fi
+# Let's process the subtitle streams to get our vobsubs.
+for subtitleID in ${subtitlesToKeep} ; do
+    if grep -sq ": $subtitleID lan" "${dvdInfo}"; then
+        let temp=$subtitleID+32
+        subtitleHexID="$(printf '%x\n' ${temp})"    # Convert SID to hex
+        echo "Processing subtitle with SID ${subtitleID}, please wait, it will take a \
+few minutes."
+        tccat -i "${workDirectory}/movie.vob" | tcextract -x ps1 -t vob -a \
+ 0x${subtitleHexID} > "${workDirectory}/subs-${subtitleID}"
+        subtitle2vobsub -o "${workDirectory}/vobsubs" -i "${workDirectory}/IFO" -a \
+ ${subtitleID} < "${workDirectory}/subs-${subtitleID}"
+    else
+        echo "Skipping non existant subtitle ${subtitleID}. Did you spell it \
+right?"
+    fi
+done
+fi                                                      # close debug if
+
+
+#======================================================================================
+# Audio processing.
+#   INFO     :
+#   LAST EDIT: 2008-05-13 12:37
+#======================================================================================
+if ! echo "$disableStages" | grep -sq -i "aud"; then    # debug if
+echo -ne "\033]0;DA3000, extracting audio streams [${movieTitle}]\007"
+echo
+for audioStreamAid in ${audioStreamsToKeep}; do
+    if grep -sq "aid: $audioStreamAid\." "${dvdInfo}"; then
+        echo "Ripping audio stream ${audioStreamAid}."
+        mplayer "${workDirectory}/movie.vob" -aid ${audioStreamAid} -dumpaudio \
+ -dumpfile "${workDirectory}/audio${audioStreamAid}" >/dev/null 2>&1
+    else
+        echo "Skipping non existant audio stream ${audioStreamAid}. Did you spell it \
+right?"
+    fi
+done
+fi                                                      # close debug if
+
+
+#======================================================================================
+# Encoding.
+#   INFO     : Refer to mencoder man page for the options used for encoding.
+#           Fast mode was copied from this article at gentoo-wiki:
+#       http://gentoo-wiki.com/HOWTO_DVD_to_Matroska
+#       This howto was also what inspired me to write DVDAssimilator3000 and what
+#       DA3000 does actually is to automate the process described in this howto.
+#           Slow mode is build upon various resources I found on the internet (guides,
+#       forum posts etc) as well on mencoder / x264 man pages.
+#   LAST EDIT: 2011-10-13 15:16
+#======================================================================================
+if ! echo "$disableStages" | grep -sq -i "enc"; then    # debug if 1
+# I do not use a custom matrix anymore, but I will keep it here for sentimental reasons.
+# Create a custom matrix for x264. This is Sharktooth's EQM_AVC_HR matrix.
+echo -e "INTRA4X4_LUMA =\n 6, 9,13,19,\n 9,14,20,27,\n13,20,28,35,\n19,27,35,42\n\n\
+INTRA4X4_CHROMAU =\n 6,10,15,20,\n10,16,21,27,\n15,21,28,33,\n20,27,33,42\n\n\
+INTRA4X4_CHROMAV =\n 6,10,15,20,\n10,16,21,27,\n15,21,28,33,\n20,27,33,42\n\n\
+INTER4X4_LUMA =\n 8,11,15,20,\n11,16,21,27,\n15,21,28,35,\n20,27,35,42 \n\n\
+INTER4X4_CHROMAU =\n 8,11,16,21,\n11,17,22,27,\n16,22,28,35,\n21,27,35,42 \n\n\
+INTER4X4_CHROMAV =\n 8,11,16,21,\n11,17,22,27,\n16,22,28,35,\n21,27,35,42 \n\n\
+INTRA8X8_LUMA =\n 6, 7, 8,10,12,14,16,18,\n 7, 9,11,13,15,16,18,20,\n\
+ 8,11,14,16,17,19,21,22,\n10,13,16,18,20,22,24,26,\n12,15,17,20,23,25,28,30,\n\
+14,16,19,22,25,29,34,38,\n16,18,21,24,28,34,46,52,\n18,20,22,26,30,38,52,72\n\n\
+INTER8X8_LUMA =\n 8, 9,10,12,14,16,19,21,\n 9,11,13,15,17,19,21,23,\n\
+10,13,16,18,20,22,23,25,\n12,15,18,21,23,24,26,32,\n14,17,20,23,25,27,33,40,\n\
+16,19,22,24,27,34,41,52,\n19,21,23,26,33,41,53,64,\n\
+21,23,25,32,40,52,64,80" > "${workDirectory}/matrix"
+echo
+echo "Now we are going for the fun part: encoding."
+echo "This will take several hours so sit back and enjoy."
+echo -ne "\033]0;DA3000, encoding video, [${movieTitle}]\007"
+echo
+if [[ "$secondPass" == [Ff][Aa][Ss][Tt] ]]; then
+    echo " [fast mode]"
+    MP_PRESET="fast"
+elif [[ "$secondPass" == [Ss][Ll][Oo][Ww] ]]; then
+    echo "[slow mode]"
+    MP_PRESET="veryslow"
+fi
+echo
+nice -n5 mencoder "${workDirectory}/movie.vob" -nosub -vf \
+ ${mplayerAddVfParams}crop=${CROP},harddup -nosound -ovc x264 -x264encopts \
+ crf=${CRF}:preset=${MP_PRESET}:tune=${MP_TUNE}:threads=${THREADS} \
+ -of rawvideo -o "${workDirectory}/movie.264" 2>/dev/null
+echo
+encoderCommandLine="-nosub -vf ${mplayerAddVfParams}crop=${CROP},harddup -nosound -ovc x264 -x264encopts  crf=${CRF}:preset=${MP_PRESET}:tune=${MP_TUNE}:threads=${THREADS} -of rawvideo"
+fi                                                      # close debug if 1
+
+
+#======================================================================================
+# mkvmerge time, most complicated process, though so easily done by hand and mmg. :(
+#   INFO     : As said the process is complicated so I chose to go first for
+#       implementation simplicity, although it may fail from time to time, then build
+#       on upon problematic DVDs. I believe we are in a really good stage now but I
+#       haven't tested with any NTSC DVDs.
+#           Please refer to mkvmerge manual for the options used.
+#   LAST EDIT: 2011-10-13 15:30
+#======================================================================================
+# A function which translates ISO639 language codes to ISO639-2 language codes.
+# We pass as an argument the ISO639 language code.
+# Actually this in not needed as I found out than mkvmerge handles ISO639-1 codes as
+# well! I left it here for emotional reasons.
+echo -ne "\033]0;DA3000, merging tracks [${movieTitle}]\007"
+iso639-to-v2 () {
+mkvmerge --list-languages|grep -E ".*\|.*\|.*$1"|sed -e 's/.*|\(.*\)|.*/\1/'|grep -o \
+ -E "[A-Za-z]++"
+}
+# Initialize mmsettings file
+mkvmergeSettings="${workDirectory}/${mkvmergeSettings}"
+#   Let's find an appropriate filename based on the movie title.
+movieFile="$(echo "${movieTitle}" | sed  -e 's/[^-[:alnum:]._() ]//g' -e 's/(/[/g' -e \
+ 's/)/]/g' -e 's/[[:space:]]$//' -e 's/[[:space:]]/_/g')"
+#       In case everything in the above line gone terrible wrong.
+if [[ $(echo "${movieFile}" | wc -c 2>/dev/null) > 1 ]]; then
+    movieFile="${workDirectory}/${movieFile}.mkv"
+else
+    movieFile="${workDirectory}/movie.mkv"
+fi
+echo -e "-o\n${movieFile}" > "${mkvmergeSettings}"
+# Set the video stream options
+echo -e "-d\n0\n--default-duration\n0:${movieFps}fps\nmovie.264" >> "$mkvmergeSettings"
+# Set the audio stream options
+for audioStreamAid in ${audioStreamsToKeep}; do
+    if [[ -r "${workDirectory}/audio${audioStreamAid}" ]]; then # Audio file exists?
+        language="$(grep "aid: ${audioStreamAid}" "${dvdInfo}" | sed -e \
+ 's/[[:space:]]aid:.*//' -e 's/.*:[[:space:]]//')"
+        echo -e "-a\n0" >> "${mkvmergeSettings}"
+        if [[ $language != unknown ]] && [[ $language != "" ]]; then # Language exists?
+            echo -e "--language\n0:${language}" >> "${mkvmergeSettings}"
+        fi
+        echo -e "audio${audioStreamAid}" >> "${mkvmergeSettings}"
+    fi
+done
+# Set the subtitles stream options
+if [ -f "${workDirectory}/vobsubs.idx" ];  then
+counter="0"
+temp="" # In this we will built the -s switch which needs to include all subtitles.
+for subtitleID in ${subtitlesToKeep}; do
+    if grep -sq ": $subtitleID lan" "${dvdInfo}"; then # This stream exists?
+        language="$(grep ".*sid.*language.*" "${dvdInfo}" | grep "[[:space:]]\
+${subtitleID}[[:space:]]" | sed -e 's/.*:[[:space:]]//')"
+        if [[ $language != unknown ]] && [[ $language != "" ]]; then # Language exists?
+            echo -e "--language\n${counter}:${language}" >> "${mkvmergeSettings}"
+        fi
+        temp="${temp},${counter}"
+        let counter+=1
+    fi
+done
+temp="$(echo "${temp}" | sed -e 's/^,//')" # trim the first comma
+echo -e "-s\n${temp}\nvobsubs.idx" >> "${mkvmergeSettings}"
+fi
+# Set Title
+ if [ $(echo -n "${movieTitle}" | sed -e 's/[[:space:]]//g' | wc -c) != "0" ]; then
+    echo -e "--title\n${movieTitle}" >> "${mkvmergeSettings}"
+fi
+# Load Chapters
+if [ -f "${workDirectory}/chapters.txt" ]; then
+    echo -e "--chapters\n${workDirectory}/chapters.txt" >> "${mkvmergeSettings}"
+fi
+# Create a tag file to load to our mkv.
+if [[ "$secondPass" == [Ff][Aa][Ss][Tt] ]]; then
+    temp=", fast 2nd pass"
+elif [[ "$secondPass" == [Ss][Ll][Oo][Ww] ]]; then
+    temp=", slow 2nd pass"
+else
+    temp=""
+fi
+echo -e "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Tags>\n <Tag>\n <Simple>\n <Name>\
+CREATED BY</Name>\n <String>${progName} ${progVersion},\
+ crf@${CRF}${temp}.</String>\n </Simple>\n </Tag>\n\
+ <Tag>\n <Simple>\n <Name>\
+mencoder command line</Name>\n <String>${encoderCommandLine}</String>\n </Simple>\n </Tag>\n\
+</Tags>" > "${workDirectory}/tag.xml"
+echo -e "--global-tags\n${workDirectory}/tag.xml" >> "${mkvmergeSettings}"
+# Ok! Let's merge our files!
+echo
+echo
+echo "Merging generated files into final matroska file."
+mkvmerge @"${mkvmergeSettings}"
+
+
+#======================================================================================
+# Cleaning temp files
+#   INFO     :
+#   LAST EDIT: 2008-05-19 16:13
+#======================================================================================
+if echo "$keepTempFiles" | grep -sq -i "no"; then
+echo -ne "\033]0;DA3000, cleaning temporary files [${movieTitle}]\007"
+echo
+echo "Cleaning temp files."
+rm -f "${workDirectory}/movie.vob"
+rm -f "${workDirectory}/movie.264"
+rm -f "${workDirectory}/divx2pass.log"
+rm -f "${workDirectory}/chapters.txt"
+rm -f "${dvdInfo}"
+rm -f "${workDirectory}"/vobsubs.{idx,sub}
+rm -f "${mkvmergeSettings}"
+rm -f "${workDirectory}/tag.xml"
+rm -f "${workDirectory}/IFO"
+rm -f "${workDirectory}/matrix"
+rm -f "${workDirectory}/divx2pass.log.mbtree"
+for subtitleID in ${subtitlesToKeep} ; do
+    rm -f "${workDirectory}/subs-${subtitleID}"
+done
+for audioStreamAid in ${audioStreamsToKeep}; do
+    rm -f "${workDirectory}/audio${audioStreamAid}"
+done
+fi
+
+
+#======================================================================================
+# The End message!
+#   INFO     :
+#   LAST EDIT: 2008-05-13 13:31
+#======================================================================================
+echo
+echo -e "Good, we finished. Your movie is saved as ${greenB}${movieFile}${rst}.\n\
+Pleasure to do business with you!"
