@@ -4,6 +4,7 @@ Copyright 2008-2011 Marios Andreopoulos (aka mrsaccess), DA3000 at andmarios dot
 Distributed under the terms of the GNU General Public License v2
 
 DVDAssimilator3000 is a bash script to rip (optional), encode and store DVDs to matroska.
+
 Key Features:
  - Source can be a DVD disk, a ISO/IMG DVD image, a ripped DVD folder
  - Video is encoded in H.264
@@ -14,6 +15,14 @@ Key Features:
  - Simplicity was the prerequisite, you don't have to do any difficult decisions.
  - Final file is a mkv, with multiple audio and subtitle tracks (language codes
    included), chapter and title information
+
+Dependencies:
+  mplayer with x264 support
+  mkvtoolnix
+  cdrtools or libcdio (for working with subtitles of DVD images [iso/img])
+  ogmtools (optional, for chapter extraction)
+  transcode
+  subtitleripper
 
 
 DVDAssimilator3000 CLI Edition is distributed in the hope that it will
